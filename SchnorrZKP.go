@@ -1,30 +1,32 @@
-package main
+package SchnorrZKP
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
-	"fmt"
-	"log"
+	"encoding/gob"
 	"math/big"
 )
 
-func CreateChallenge(a *ecdsa.PrivateKey) ([]byte, *ecdsa.PrivateKey, *ecdsa.PrivateKey, *big.Int){
-	curve := elliptic.P256()
-	v, err := ecdsa.GenerateKey(curve, rand.Reader)
-	if err != nil{
-		log.Panic(err)
-	}
+type SchnorrProof struct {
+	r *big.Int
+	A ecdsa.PublicKey
+	V *big.Int
+}
+
+//for this proof we assume both parties are using the same curve which has been decided ahead of time
+var curve = elliptic.P256()
+
+func createChallenge(a *ecdsa.PrivateKey, v *ecdsa.PrivateKey) ([]byte, *ecdsa.PrivateKey, *big.Int) {
 
 	//gets public keys from private keyes
 	V := v.PublicKey.X.Bytes()
 	A := a.PublicKey.X.Bytes()
 
-
 	//gets curve order
 	parameters := curve.Params()
-	n:= parameters.N
+	n := parameters.N
 
 	generatorPointX := parameters.Gx
 	generatorPointXBytes := generatorPointX.Bytes()
@@ -34,68 +36,75 @@ func CreateChallenge(a *ecdsa.PrivateKey) ([]byte, *ecdsa.PrivateKey, *ecdsa.Pri
 
 	challenge := sha256.Sum256(challengeBytes)
 	c := challenge[:]
-	return c, a, v, n
+	return c, a, n
 }
 
-func CreateProof(a *ecdsa.PrivateKey) (*big.Int, ecdsa.PublicKey, *big.Int){
-	c, a, v, n := CreateChallenge(a)
+func CreateProof(a *ecdsa.PrivateKey, v *ecdsa.PrivateKey) *SchnorrProof {
+	/*
+		Takes in a private key and returns what is required for a schnorr ZKP
+	*/
+
+	//calls the helper function CreateChallenge
+	c, a, n := createChallenge(a, v)
 
 	//gets public keys
 	V := v.PublicKey.X
 
+	//creates a numerical representation of the challenge
 	cN := new(big.Int)
 	cN.SetBytes(c)
 
+	//operations calculating r = v - a*c mod n
 	r := new(big.Int)
-	r.Mul(a.D ,cN)
-	r.Sub(v.D,r)
+	r.Mul(a.D, cN)
+	r.Sub(v.D, r)
 	r.Mod(r, n)
 
-
-
-
-
-	return r, a.PublicKey, V
+	return &SchnorrProof{r, a.PublicKey, V}
 
 }
 
-func VerifyProof(r *big.Int, A ecdsa.PublicKey, V *big.Int ) (bool){
-	curve := elliptic.P256()
-	if !curve.IsOnCurve(A.X, A.Y){
+func VerifyProof(proof *SchnorrProof) bool {
+
+	//if the key is not on the curve the proof is automatically false
+	if !curve.IsOnCurve(proof.A.X, proof.A.Y) {
 		return false
 	}
 
+	//calculated G * [r] (GxrX represents the X coordinate of G * [r]. Likewise, GxrY represents G * [r]'s Y coordinate)
+	GxrX, GxrY := curve.ScalarBaseMult(proof.r.Bytes())
 
-	GxrX,GxrY := curve.ScalarBaseMult(r.Bytes())
-	challengeBytes := append(curve.Params().Gx.Bytes(), V.Bytes()...)
-	challengeBytes = append(challengeBytes,A.X.Bytes()...)
-	challenge := sha256.Sum256(challengeBytes)
-	c := challenge[:]
+	c := getChallenge(curve.Params(), proof.V, proof.A)
 
-	AxcX, AxcY := curve.ScalarMult(A.X, A.Y, c)
+	AxcX, AxcY := curve.ScalarMult(proof.A.X, proof.A.Y, c)
 
+	//finalX represents the addition of points in A * [c] + G * [r]
 	finalX := new(big.Int)
+	finalX, _ = curve.Add(GxrX, GxrY, AxcX, AxcY)
 
-	finalX, _= curve.Add(GxrX,GxrY, AxcX,AxcY)
-	fmt.Print(finalX, "\n" )
-	fmt.Print(V, "\n")
-
-	return finalX.Cmp(V) == 0
-
+	return finalX.Cmp(proof.V) == 0
 
 }
 
-func main() {
-	curve := elliptic.P256()
+func getChallenge(parameters *elliptic.CurveParams, V *big.Int, A ecdsa.PublicKey) []byte {
+	challengeBytes := append(parameters.Gx.Bytes(), V.Bytes()...)
+	challengeBytes = append(challengeBytes, A.X.Bytes()...)
+	challenge := sha256.Sum256(challengeBytes)
+	return challenge[:]
+}
 
-	a, err := ecdsa.GenerateKey(curve,rand.Reader)
-	if err != nil{
-		log.Panic(err)
-	}
-	r, A, V := CreateProof(a)
+func SerializeProof(proof *SchnorrProof) []byte {
+	var buf bytes.Buffer
 
-	fmt.Print(VerifyProof(r,A,V))
+	encoder := gob.NewEncoder(&buf)
+	encoder.Encode(proof)
 
+	return buf.Bytes()
+}
 
-
+func DeserializeProof(proofBytes []byte) *SchnorrProof {
+	var proof SchnorrProof
+	decoder := gob.NewDecoder(bytes.NewReader(proofBytes))
+	decoder.Decode(&proof)
+	return &proof
 }
